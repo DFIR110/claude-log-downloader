@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CLAUDE Log Downloader</title>
+<style>
+
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; padding: 2rem 1.25rem 3rem; font: 16px/1.7 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", Meiryo, sans-serif; color: #1a1a1a; background: #fff; }
+.wrap { max-width: 860px; margin: 0 auto; }
+h1 { font-size: 1.4rem; margin: 0; }
+.lead { margin: .2rem 0 1.5rem; color: #555; }
+h2 { font-size: 1.05rem; margin: 2rem 0 .6rem; padding-bottom: .3rem; border-bottom: 1px solid #ccc; }
+p { margin: .5rem 0; }
+.notes { border: 2px solid #1a1a1a; padding: .9rem 1.2rem; }
+.notes h2 { margin: 0 0 .4rem; padding: 0; border: 0; }
+.notes ol { margin: 0; padding-left: 1.4rem; }
+.notes li { margin: .25rem 0; }
+.drop { border: 1px dashed #888; padding: 1.2rem; text-align: center; }
+.drop.dragover { background: #f0f0f0; border-style: solid; }
+.muted { color: #666; }
+.small { font-size: .875rem; }
+.mono { font-family: ui-monospace, SFMono-Regular, Consolas, Menlo, monospace; font-size: .85rem; word-break: break-all; }
+.off { opacity: .4; }
+.error { color: #b00020; font-weight: 700; }
+button, a.open { font: inherit; display: inline-block; padding: .3rem .9rem; border: 1px solid #1a1a1a; border-radius: 3px; background: #fff; color: #1a1a1a; text-decoration: none; cursor: pointer; white-space: nowrap; }
+button:hover, a.open:hover { background: #1a1a1a; color: #fff; }
+a.open.done { border-color: #999; color: #777; }
+a.open.done:hover { background: #777; color: #fff; }
+:focus-visible { outline: 2px solid #0057b8; outline-offset: 2px; }
+table { border-collapse: collapse; width: 100%; margin-top: .6rem; }
+th, td { border: 1px solid #ccc; padding: .45rem .7rem; text-align: left; vertical-align: middle; }
+th { background: #f3f3f3; font-weight: 600; white-space: nowrap; }
+.tablewrap { overflow-x: auto; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: .1rem 1rem; margin: .8rem 0 0; }
+dt { color: #666; } dd { margin: 0; overflow-wrap: anywhere; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>CLAUDE Log Downloader</h1>
+  <p class="lead">エクスポートの zip を、manifest のリンクから1つずつ落とす</p>
+
+  <div class="notes">
+    <h2>はじめに</h2>
+    <ol>
+      <li>claude.ai にログインしているブラウザを使用してください。</li>
+      <li>Safari の場合、設定の「ダウンロード後、"安全な"ファイルを開く」をオフにしてください。</li>
+      <li>リンクは1回しか使えないことがあります。1つ落とし終えてから次を開いてください。</li>
+      <li>ファイルはブラウザが読み込みますが、外部へは送信されません。</li>
+    </ol>
+  </div>
+
+  <h2>1. manifest を選ぶ</h2>
+  <div class="drop" id="mdrop">
+    <button type="button" id="mpick">manifest を選ぶ</button>
+    <p class="small muted">エクスポートのメールから保存した manifest-….json。ここにドロップしても読めます。</p>
+  </div>
+  <input type="file" id="minput" accept=".json,application/json" hidden>
+  <div id="mstatus"></div>
+
+  <div id="s2" class="off">
+    <h2>2. リンクを1つずつ開いて落とす</h2>
+    <div id="links"><p class="muted">manifest を選ぶと、ここにリンクが並びます。</p></div>
+  </div>
+</div>
+
+<script>
+
+(function (root) {
+  'use strict';
+
+  function isObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function toText(value) {
+    if (value === null || value === undefined) {
+      return '';
+    }
+    return String(value);
+  }
+
+  function fileNameOnly(path) {
+    const normalized = toText(path).replace(/\\/g, '/');
+    return normalized.slice(normalized.lastIndexOf('/') + 1);
+  }
+
+  function collectEntries(value, found) {
+    if (Array.isArray(value)) {
+      value.forEach(function (item) {
+        collectEntries(item, found);
+      });
+      return;
+    }
+    if (isObject(value)) {
+      if ('export_url' in value) {
+        found.push(value);
+        return;
+      }
+      Object.keys(value).forEach(function (key) {
+        collectEntries(value[key], found);
+      });
+    }
+  }
+
+  function urlState(url) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (error) {
+      return 'invalid';
+    }
+    if (parsed.protocol !== 'https:') {
+      return 'invalid';
+    }
+    if (parsed.hostname === 'claude.ai') {
+      return 'ok';
+    }
+    return 'other-host';
+  }
+
+  function parseManifest(text) {
+    const data = JSON.parse(text.replace(/^﻿/, ''));
+
+    const found = [];
+    collectEntries(data, found);
+    if (found.length === 0) {
+      throw new Error('ダウンロード先(export_url)が1件も見つかりません。エクスポートの manifest ではないようです');
+    }
+
+    const createdAt = isObject(data) ? toText(data.created_at) : '';
+    const createdTime = Date.parse(createdAt);
+    let expiresAt = '';
+    if (!isNaN(createdTime)) {
+      expiresAt = new Date(createdTime + 24 * 3600 * 1000).toISOString();
+    }
+
+    const entries = found.map(function (item, index) {
+      let filename = fileNameOnly(item.filename);
+      if (filename === '' || filename === '.' || filename === '..') {
+        filename = 'part-' + index + '.zip';
+      }
+      const exportUrl = toText(item.export_url);
+      return {
+        index: index,
+        filename: filename,
+        category: toText(item.category),
+        part: toText(item.part),
+        batch_index: toText(item.batch_index),
+        export_url: exportUrl,
+        url_state: urlState(exportUrl)
+      };
+    });
+
+    return {
+      created_at: createdAt,
+      total_files: isObject(data) ? toText(data.total_files) : '',
+      version: isObject(data) ? toText(data.version) : '',
+      expires_at: expiresAt,
+      entries: entries
+    };
+  }
+
+  const api = {
+    parseManifest: parseManifest,
+    urlState: urlState
+  };
+
+  root.ACQ = api;
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = api;
+  }
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+</script>
+
+<script>
+(function () {
+  'use strict';
+
+  function byId(id) {
+    return document.getElementById(id);
+  }
+
+  function el(tag, options, children) {
+    const node = document.createElement(tag);
+    const opts = options || {};
+    if (opts.className) {
+      node.className = opts.className;
+    }
+    if (opts.text !== undefined) {
+      node.textContent = opts.text;
+    }
+    if (opts.attrs) {
+      Object.keys(opts.attrs).forEach(function (name) {
+        node.setAttribute(name, opts.attrs[name]);
+      });
+    }
+    (children || []).forEach(function (child) {
+      if (child) {
+        node.append(child);
+      }
+    });
+    return node;
+  }
+
+  function clear(node) {
+    while (node.firstChild) {
+      node.removeChild(node.firstChild);
+    }
+    return node;
+  }
+
+  function twoDigits(number) {
+    return String(number).padStart(2, '0');
+  }
+
+  function formatLocalTime(isoText) {
+    const date = new Date(isoText);
+    if (isNaN(date)) {
+      return isoText || '';
+    }
+    const day = date.getFullYear() + '-' + twoDigits(date.getMonth() + 1) + '-' + twoDigits(date.getDate());
+    const time = twoDigits(date.getHours()) + ':' + twoDigits(date.getMinutes()) + ':' + twoDigits(date.getSeconds());
+    return day + ' ' + time;
+  }
+
+  async function sha256Hex(file) {
+    if (!(window.crypto && window.crypto.subtle)) {
+      return '';
+    }
+    const bytes = await file.arrayBuffer();
+    const digest = await window.crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest), function (byte) {
+      return byte.toString(16).padStart(2, '0');
+    }).join('');
+  }
+
+  const state = { manifest: null, manifestFile: '', manifestSha: '', opened: {} };
+
+  function storageKey() {
+    return 'llmx-acq-' + (state.manifestSha || state.manifestFile);
+  }
+
+  function saveOpened() {
+    try {
+      window.sessionStorage.setItem(storageKey(), JSON.stringify(state.opened));
+    } catch (error) {
+    }
+  }
+
+  function loadOpened() {
+    try {
+      return JSON.parse(window.sessionStorage.getItem(storageKey()) || '{}') || {};
+    } catch (error) {
+      return {};
+    }
+  }
+
+  async function showManifest(file) {
+    const status = clear(byId('mstatus'));
+
+    try {
+      const text = await file.text();
+      state.manifest = ACQ.parseManifest(text);
+      state.manifestFile = file.name;
+      state.manifestSha = await sha256Hex(file);
+      state.opened = loadOpened();
+    } catch (error) {
+      state.manifest = null;
+      status.append(el('p', { className: 'error', text: 'manifest を読めません: ' + error.message }));
+      byId('s2').classList.add('off');
+      clear(byId('links'));
+      return;
+    }
+
+    const manifest = state.manifest;
+
+    let countText = manifest.entries.length + ' 件';
+    if (manifest.total_files && String(manifest.entries.length) !== manifest.total_files) {
+      countText += '(total_files は ' + manifest.total_files + ')';
+    }
+
+    const rows = [
+      el('dt', { text: 'ファイル' }),
+      el('dd', { text: state.manifestFile })
+    ];
+    if (state.manifestSha) {
+      rows.push(el('dt', { text: 'SHA-256' }));
+      rows.push(el('dd', { className: 'mono', text: state.manifestSha }));
+    }
+    rows.push(el('dt', { text: '作成' }));
+    rows.push(el('dd', { text: manifest.created_at ? formatLocalTime(manifest.created_at) + '(この端末の時刻)' : '(記載なし)' }));
+    rows.push(el('dt', { text: '件数' }));
+    rows.push(el('dd', { text: countText }));
+    status.append(el('dl', {}, rows));
+
+    if (manifest.expires_at) {
+      const remaining = Date.parse(manifest.expires_at) - Date.now();
+      const deadline = formatLocalTime(manifest.expires_at);
+      if (remaining <= 0) {
+        status.append(el('p', { className: 'error', text: 'リンクの期限(作成から24時間: ' + deadline + ')を過ぎています。エクスポートをやり直してください。' }));
+      } else {
+        const hours = Math.floor(remaining / 3600000);
+        const minutes = Math.floor(remaining % 3600000 / 60000);
+        status.append(el('p', { text: 'リンクの期限は ' + deadline + ' ごろ(残り約 ' + hours + ' 時間 ' + minutes + ' 分)です。' }));
+      }
+    }
+
+    byId('s2').classList.remove('off');
+    drawLinks();
+  }
+
+  function makeLinkCell(entry) {
+    if (entry.url_state === 'invalid') {
+      return el('span', { className: 'error', text: 'https のリンクではないため開けません' });
+    }
+
+    const openedAt = state.opened[entry.index];
+
+    const link = el('a', {
+      className: openedAt ? 'open done' : 'open',
+      text: openedAt ? 'もう一度開く' : '開いて落とす',
+      attrs: { href: entry.export_url, target: '_blank', rel: 'noopener noreferrer' }
+    });
+
+    link.addEventListener('click', function (event) {
+      if (entry.url_state === 'other-host') {
+        const message = 'このリンクは claude.ai ではありません。\n' + entry.export_url + '\n\n本当に開きますか?';
+        if (!window.confirm(message)) {
+          event.preventDefault();
+          return;
+        }
+      }
+      if (state.opened[entry.index]) {
+        const message = entry.filename + ' のリンクは ' + formatLocalTime(state.opened[entry.index]) + ' に一度開いています。\nリンクは1回しか使えないことがあります。もう一度開きますか?';
+        if (!window.confirm(message)) {
+          event.preventDefault();
+          return;
+        }
+      }
+      if (!state.opened[entry.index]) {
+        state.opened[entry.index] = new Date().toISOString();
+        saveOpened();
+      }
+      window.setTimeout(drawLinks, 0);
+    });
+
+    const warning = entry.url_state === 'other-host' ? el('span', { className: 'error', text: ' claude.ai 以外' }) : null;
+    return el('span', {}, [link, warning]);
+  }
+
+  function drawLinks() {
+    const body = el('tbody');
+
+    state.manifest.entries.forEach(function (entry) {
+      const openedAt = state.opened[entry.index];
+      const stateCell = openedAt
+        ? el('td', { text: '開いた ' + formatLocalTime(openedAt).slice(11) })
+        : el('td', { className: 'muted', text: 'まだ' });
+
+      body.append(el('tr', {}, [
+        el('td', { text: String(entry.index + 1) }),
+        el('td', { text: entry.category }),
+        el('td', { className: 'mono', text: entry.filename }),
+        el('td', {}, [makeLinkCell(entry)]),
+        stateCell
+      ]));
+    });
+
+    const headings = ['#', '種類', 'ファイル名', 'リンク', '状態'].map(function (title) {
+      return el('th', { text: title });
+    });
+    const table = el('table', {}, [el('thead', {}, [el('tr', {}, headings)]), body]);
+
+    const openedCount = Object.keys(state.opened).length;
+    const summary = state.manifest.entries.length + ' 件中 ' + openedCount + ' 件を開きました。リンクは新しいタブで開きます。';
+
+    clear(byId('links')).append(
+      el('div', { className: 'tablewrap' }, [table]),
+      el('p', { className: 'small muted', text: summary })
+    );
+  }
+
+  const dropArea = byId('mdrop');
+  const fileInput = byId('minput');
+
+  function takeFiles(files) {
+    const jsonFile = files.find(function (file) {
+      return /\.json$/i.test(file.name);
+    });
+    const chosen = jsonFile || files[0];
+    if (chosen) {
+      showManifest(chosen);
+    }
+  }
+
+  byId('mpick').addEventListener('click', function () {
+    fileInput.click();
+  });
+
+  fileInput.addEventListener('change', function () {
+    takeFiles(Array.from(fileInput.files));
+    fileInput.value = '';
+  });
+
+  dropArea.addEventListener('dragover', function (event) {
+    event.preventDefault();
+    dropArea.classList.add('dragover');
+  });
+  dropArea.addEventListener('dragleave', function () {
+    dropArea.classList.remove('dragover');
+  });
+
+  dropArea.addEventListener('drop', function (event) {
+    event.preventDefault();
+    dropArea.classList.remove('dragover');
+    takeFiles(Array.from(event.dataTransfer.files || []));
+  });
+
+  window.addEventListener('dragover', function (event) {
+    event.preventDefault();
+  });
+  window.addEventListener('drop', function (event) {
+    event.preventDefault();
+  });
+
+  window.ACQ_PAGE = { loadManifest: showManifest };
+})();
+</script>
+</body>
+</html>
